@@ -1,6 +1,6 @@
-use nix::sched::sched_getaffinity;
-use nix::sched::CpuSet;
-use nix::unistd::Pid;
+//use nix::sched::sched_getaffinity;
+//use nix::sched::CpuSet;
+//use nix::unistd::Pid;
 use std::ffi::c_int;
 use std::fmt;
 use std::fs;
@@ -35,12 +35,6 @@ impl From<io::Error> for Errno {
 impl From<ParseIntError> for Errno {
     fn from(_: ParseIntError) -> Self {
         Errno { errno: EINVAL }
-    }
-}
-
-impl From<nix::errno::Errno> for Errno {
-    fn from(err: nix::errno::Errno) -> Self {
-        Errno { errno: err as i32 }
     }
 }
 
@@ -99,13 +93,55 @@ fn cpu_count_from_quota(base_cg: PathBuf) -> Result<c_int> {
     parse_cfs_quota_as_cpus(cpus_max)
 }
 
+pub struct CpuSet {
+    #[cfg(not(target_os = "freebsd"))]
+    cpu_set: libc::cpu_set_t,
+    #[cfg(target_os = "freebsd")]
+    cpu_set: libc::cpuset_t,
+}
+
+fn cpu_set_sched_getaffinity(pid: i32) -> Result<CpuSet> {
+    let mut cpuset = CpuSet {
+        cpu_set: unsafe { std::mem::zeroed() },
+    };
+    let res = unsafe {
+        libc::sched_getaffinity(
+            pid,
+            std::mem::size_of::<CpuSet>() as libc::size_t,
+            &mut cpuset.cpu_set,
+        )
+    };
+
+    if res == 0 {
+        return Ok(cpuset);
+    }
+    Err(Errno { errno: res })
+}
+
+/// Return the maximum number of CPU in CpuSet
+const fn cpu_set_count() -> usize {
+    #[cfg(not(target_os = "freebsd"))]
+    let bytes = std::mem::size_of::<libc::cpu_set_t>();
+    #[cfg(target_os = "freebsd")]
+    let bytes = std::mem::size_of::<libc::cpuset_t>();
+
+    8 * bytes
+}
+
+fn cpu_set_is_set(field: usize, cpuset: &CpuSet) -> Result<bool> {
+    if field >= cpu_set_count() {
+        Err(Errno { errno: EINVAL })
+    } else {
+        Ok(unsafe { libc::CPU_ISSET(field, &cpuset.cpu_set) })
+    }
+}
+
 fn get_affinity_cpu_count() -> Result<c_int> {
-    let pid = Pid::from_raw(0);
-    let cpuset = sched_getaffinity(pid)?;
+    let cpuset = cpu_set_sched_getaffinity(0)?;
 
     let mut count = 0;
-    for cpu in 0..CpuSet::count() {
-        if cpuset.is_set(cpu)? {
+    for cpu in 0..cpu_set_count() {
+        if cpu_set_is_set(cpu, &cpuset)? {
             count += 1;
         }
     }
